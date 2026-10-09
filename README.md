@@ -2,6 +2,7 @@
 
 An e-commerce backend for a perfume shop, with change data capture, full-text search and an AI shopping assistant.
 
+[Quick start](#quick-start) ·
 [API docs](docs/modules) ·
 [Postman collection](postman/per-api-collection.json) ·
 [Knowledge base](knowledge)
@@ -10,16 +11,18 @@ An e-commerce backend for a perfume shop, with change data capture, full-text se
 
 ## About
 
-Per is the backend of an online perfume store. Shoppers register, browse products by brand,
-category and country of origin, search the catalogue, fill a cart and pay through PayOS.
-Each product carries perfume details such as fragrance family, sillage, longevity and
-seasonality. A built-in assistant answers questions like "a fresh scent for summer" by
-searching the catalogue and the shop's own guides, then asking an OpenAI model to reply with
-product recommendations. Administrators manage the catalogue, images, users and the
-assistant's knowledge base through the same API.
+Per is the backend of an online perfume store.
 
-The whole backend is one Spring Boot application (a modular monolith) built with Java 21. The
-API lives under `/per`.
+- Shoppers browse by brand, category and country of origin, search the catalogue, fill a cart
+  and pay through PayOS.
+- Every product carries perfume details: fragrance family, sillage, longevity and seasonality.
+- An AI assistant answers questions such as "a fresh scent for summer" with product
+  recommendations, drawing on the catalogue and the shop's own guides.
+- Administrators manage the catalogue, images, users and the assistant's knowledge base through
+  the same API.
+
+It is one Spring Boot application (a modular monolith) on Java 21. Every endpoint lives under
+`/per`.
 
 ## Architecture
 
@@ -27,12 +30,12 @@ API lives under `/per`.
 
 [![Runtime architecture: client, edge, Spring Boot modular monolith, Kafka, data stores and external services](docs/asset/runtime.png)](docs/asset/runtime.png)
 
-In production the application ran on a single VPS. Requests reached it through a Cloudflare
-Tunnel and Nginx, then passed the security layer: a JWT filter, role checks on admin
-endpoints, and Resilience4j rate limits, circuit breakers and retries. All of this runs
-inside the application; there is no separate API gateway.
+A request takes this path:
 
-The thirteen modules fall into four groups:
+1. In production it arrived through a Cloudflare Tunnel and Nginx on a single VPS.
+2. Inside the application, a JWT filter, admin role checks and Resilience4j rate limits, circuit
+   breakers and retries run first. These live in the app itself; there is no separate gateway.
+3. One of thirteen modules handles it:
 
 | Group | Modules |
 |-------|---------|
@@ -41,43 +44,29 @@ The thirteen modules fall into four groups:
 | Commerce | `cart`, `order`, `payment` |
 | Platform | `media`, `mail`, `rag` |
 
-PostgreSQL is the system of record. The other stores are derived from it:
+PostgreSQL is the system of record, and the other stores are rebuilt from it:
 
 | Store | Holds |
 |-------|-------|
-| PostgreSQL 16 | All business data, migrated by Flyway; runs with logical WAL for Debezium |
+| PostgreSQL 16 | All business data, migrated by Flyway, with logical WAL for Debezium |
 | Redis 7 | Cached catalogue lookups and refresh tokens |
 | Elasticsearch 7.17 | Full-text search over products, brands and categories |
 | Qdrant | Embeddings for the AI assistant, in four collections |
 
-Changes reach the search index and the assistant through Kafka. Debezium reads PostgreSQL's
-write-ahead log for the catalogue tables and publishes each change. The application also
-publishes its own index events and email jobs. Kafka consumers inside the application then
-update Elasticsearch and Qdrant, or send the email. A failed email goes to a dead-letter topic.
+Changes reach search and the assistant through Kafka:
 
-Checkout locks each product variant row before it deducts stock, so two shoppers cannot buy
-the same last unit. The order then waits for payment. PayOS reports the result by webhook,
-and the order becomes paid or is cancelled with its stock returned; a scheduler also cancels
-payments that expire.
+- Debezium reads PostgreSQL's write-ahead log for the catalogue tables and publishes each change.
+- The application publishes its own index events and email jobs.
+- Consumers inside the application update Elasticsearch and Qdrant, or send the email. A failed
+  email goes to a dead-letter topic.
 
-The application also calls four external services: OpenAI for embeddings and answers, PayOS
-for payments, Cloudinary for product and brand images, and an SMTP server for welcome and
+Checkout locks each product variant row before it deducts stock, so two shoppers cannot buy the
+same last unit. PayOS then reports the payment by webhook: the order becomes paid, or it is
+cancelled and its stock returned. A scheduler cancels payments that expire.
+
+The application calls four external services: OpenAI for embeddings and answers, PayOS for
+payments, Cloudinary for product and brand images, and an SMTP server for welcome and
 password-reset email.
-
-### How code reaches production and how it is watched
-
-[![Delivery, logging and monitoring: GitHub, GitHub Actions, Jenkins, Docker Hub, ELK, Prometheus and Grafana](docs/asset/ops.png)](docs/asset/ops.png)
-
-Every push and pull request to `main` or `release` runs the unit tests in GitHub Actions.
-Every push also triggers Jenkins, which builds the application inside a multi-stage Docker
-build, pushes the image to Docker Hub as `nguyenminh1301/per` (tagged with the project version
-and `latest`), and restarts the stack on the VPS with Docker Compose.
-
-The application sends JSON logs over TCP to Logstash, which indexes them into Elasticsearch
-(the same instance that serves product search) for Kibana. Prometheus scrapes
-`/actuator/prometheus` and the host, Redis and PostgreSQL exporters, and Grafana builds
-dashboards and alerts on top. In production, the team reached Kibana and Grafana through a
-Cloudflare Zero Trust subdomain.
 
 ### How the AI assistant answers
 
@@ -92,27 +81,48 @@ The assistant uses retrieval-augmented generation. Two pipelines fill Qdrant:
   stored in `knowledge_vectors`. This runs at startup when the collection is empty, or when an
   administrator calls `POST /per/rag/index/knowledge`.
 
-A question sent to `POST /per/rag/chat` is embedded with the same model and matched against all
-four collections, keeping the top 3 results from each that score 0.3 or higher. The hits are
-merged into one context block and placed in a prompt with the system instructions from
-`knowledge/system-prompt.txt`, the question and the expected JSON format. The OpenAI chat
-model writes the answer; the application cleans and parses it, and falls back to a canned
-answer if the JSON is unusable. The reply contains a summary, a detailed answer, recommended
-products and next steps. `GET /per/rag/chat/stream` returns the same answer as plain-text
-server-sent events.
+A question sent to `POST /per/rag/chat` goes through five steps:
+
+1. The question is embedded with the same model used at ingest.
+2. All four collections are searched, keeping the top 3 matches from each that score 0.3 or
+   higher.
+3. The matches are merged into one context block and placed in a prompt with the instructions
+   from `knowledge/system-prompt.txt`, the question and the expected JSON format.
+4. The OpenAI chat model writes the answer. The application parses the JSON, or falls back to a
+   canned answer if parsing fails.
+5. The reply holds a summary, a detailed answer, recommended products and next steps.
+
+`GET /per/rag/chat/stream` streams the same answer as plain-text server-sent events.
+
+### How code reaches production and how it is watched
+
+[![Delivery, logging and monitoring: GitHub, GitHub Actions, Jenkins, Docker Hub, ELK, Prometheus and Grafana](docs/asset/ops.png)](docs/asset/ops.png)
+
+GitHub Actions runs the unit tests for every push and pull request to `main` and `release`.
+Every push also starts Jenkins, which delivers the change:
+
+1. Builds the application inside a multi-stage Docker build.
+2. Pushes the image to Docker Hub as `nguyenminh1301/per`, tagged with the project version and
+   `latest`.
+3. Restarts the stack on the VPS with Docker Compose.
+
+The running system is watched like this:
+
+- Logs: the application sends JSON logs over TCP to Logstash, which indexes them into
+  Elasticsearch (the same instance that serves product search). Kibana searches them.
+- Metrics: Prometheus scrapes `/actuator/prometheus` and the host, Redis and PostgreSQL
+  exporters. Grafana turns them into dashboards and alerts.
+- Access: in production, Kibana and Grafana sat behind a Cloudflare Zero Trust subdomain.
 
 ## Tech stack
 
 | Area | Technology |
 |------|------------|
-| Application | Java 21, Spring Boot 3.5, Spring Security with JWT, Spring Data JPA, Flyway, MapStruct, Resilience4j |
+| Application | Java 21, Spring Boot 3.5, Spring Security with JWT, Spring Data JPA, Flyway, MapStruct, Resilience4j; tests with JUnit 5 and JaCoCo |
 | AI | Spring AI 1.0 (milestone), OpenAI models, Qdrant |
-| Messaging and CDC | Kafka (Confluent 7.6), Debezium 2.5 |
-| Data | PostgreSQL 16 with pgvector, Redis 7, Elasticsearch 7.17 |
+| Data and messaging | PostgreSQL 16 with pgvector, Redis 7, Elasticsearch 7.17, Kafka (Confluent 7.6), Debezium 2.5 |
 | External services | PayOS, Cloudinary, SMTP |
-| Delivery | GitHub Actions, Jenkins, Docker, Docker Hub, Docker Compose |
-| Observability | Logstash, Elasticsearch, Kibana, Prometheus, Grafana, node, Redis and PostgreSQL exporters |
-| Testing | JUnit 5 with Spring Boot Test, JaCoCo |
+| Delivery and observability | GitHub Actions, Jenkins, Docker Hub, Docker Compose, Logstash, Kibana, Prometheus, Grafana |
 
 ## Documentation
 
@@ -123,14 +133,10 @@ server-sent events.
 | [`docs/elasticsearch/`](docs/elasticsearch) | Indexing strategy, re-indexing and queries |
 | [`docs/cache/`](docs/cache) | Redis cache configuration and the token blacklist |
 | [`docs/resilience-patterns/`](docs/resilience-patterns) | Rate limiting and circuit breakers |
-| [`postman/per-api-collection.json`](postman/per-api-collection.json) | Every endpoint, ready to import into Postman |
 
 ## Quick start
 
-Requirements:
-
-- Java 21
-- Docker Desktop
+You need Java 21 and Docker Desktop.
 
 1. Clone the repository:
 
@@ -139,16 +145,18 @@ Requirements:
    cd e-commerce-platform
    ```
 
-2. Create `.env` from the example and fill it in. The application reads this file on
-   startup, and Docker Compose uses it for the containers.
+2. Create `.env` and fill in the credentials. The application and Docker Compose both read it.
 
    ```bash
    cp .env.example .env
    ```
 
-   The example points at container host names (`postgres`, `redis`, `kafka`, `qdrant`,
-   `elasticsearch`). When you run the application on your own machine, as in step 4, point
-   it at the published ports instead:
+   > Important: the AI assistant needs `OPENAI_API_KEY`, `OPENAI_CHAT_MODEL` and
+   > `OPENAI_EMBEDDING_MODEL`. Payments, image uploads and email need the PayOS, Cloudinary
+   > and SMTP credentials.
+
+3. Point the application at your machine. The example uses container host names, which only
+   resolve inside Docker, so change these five lines in `.env`:
 
    ```dotenv
    POSTGRES_URL=jdbc:postgresql://localhost:5432/postgres
@@ -158,43 +166,38 @@ Requirements:
    ELASTICSEARCH_URI=http://localhost:9200
    ```
 
-   > Important: the AI assistant needs `OPENAI_API_KEY`, `OPENAI_CHAT_MODEL` and
-   > `OPENAI_EMBEDDING_MODEL`. Payments, image uploads and email need the PayOS, Cloudinary
-   > and SMTP credentials.
-
-3. Start the infrastructure:
+4. Start the infrastructure. The Debezium connector registers itself once Kafka Connect is up.
 
    ```bash
    docker compose up -d
    ```
 
-   This starts PostgreSQL, Redis, Kafka, Debezium, Elasticsearch, Logstash, Kibana, Qdrant,
-   Prometheus, Grafana, the metric exporters and the Kafka and Debezium web consoles. The
-   Debezium connector registers itself once Kafka Connect is up.
-
-4. Run the application:
+5. Start the application. On first start, Flyway creates the schema and loads demo data, and
+   the assistant indexes the catalogue and the knowledge base into Qdrant.
 
    ```bash
    ./mvnw spring-boot:run
    ```
 
-   Or `make run`, which checks that Java, Docker and `.env` are present, starts the
-   containers and then the application. On first start, Flyway creates the schema and loads
-   demo data, and the assistant indexes the catalogue and the knowledge base into Qdrant.
+   `make run` does steps 4 and 5 together after checking that Java, Docker and `.env` are
+   present.
 
-The API listens on `http://localhost:8080/per`. With the default `dev` profile, Swagger UI is
-at `http://localhost:8080/per/api-docs`.
+The API is now on `http://localhost:8080/per`, and Swagger UI on
+`http://localhost:8080/per/api-docs`.
 
 ### Local consoles
 
-| Tool | Address |
-|------|---------|
-| Kafka UI | `http://localhost:8090` |
-| Debezium UI | `http://localhost:8084` |
-| Kibana | `http://localhost:5601` |
-| Grafana | `http://localhost:3000` |
-| Prometheus | `http://localhost:9091` |
-| Qdrant | `http://localhost:6333/dashboard` |
+Data and messaging:
+
+- Kafka UI: `http://localhost:8090`
+- Debezium UI: `http://localhost:8084`
+- Qdrant: `http://localhost:6333/dashboard`
+
+Logs and metrics:
+
+- Kibana: `http://localhost:5601`
+- Grafana: `http://localhost:3000`
+- Prometheus: `http://localhost:9091`
 
 ### Running the tests
 
